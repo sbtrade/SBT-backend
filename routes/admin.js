@@ -406,7 +406,7 @@ router.post('/fund-requests/reject', async (req, res) => {
 router.get('/transfer-requests', async (req, res) => {
   try {
     const result = await db.query(
-      `SELECT tr.id, tr.amount, tr.receiver_user_id, tr.created_at, u.fullname AS sender_name, u.user_id AS sender_user_id 
+      `SELECT tr.id, tr.amount, tr.receiver_user_id, tr.receiver_wallet_address, tr.created_at, u.fullname AS sender_name, u.user_id AS sender_user_id 
        FROM transfer_requests tr
        JOIN users u ON tr.sender_id = u.id
        WHERE tr.status = 'PENDING'
@@ -430,20 +430,13 @@ router.post('/transfer-requests/approve', async (req, res) => {
   }
 
   try {
-    const reqRes = await db.query('SELECT sender_id, receiver_user_id, amount FROM transfer_requests WHERE id = $1 AND status = \'PENDING\'', [id]);
+    const reqRes = await db.query('SELECT sender_id, receiver_user_id, receiver_wallet_address, amount FROM transfer_requests WHERE id = $1 AND status = \'PENDING\'', [id]);
     if (reqRes.rows.length === 0) {
       return res.status(404).json({ error: 'Pending transfer request not found.' });
     }
 
-    const { sender_id, receiver_user_id, amount } = reqRes.rows[0];
+    const { sender_id, receiver_user_id, receiver_wallet_address, amount } = reqRes.rows[0];
     const numAmount = parseFloat(amount);
-
-    const recRes = await db.query('SELECT id FROM users WHERE user_id = $1 AND role = \'USER\' AND status = \'ACTIVE\'', [receiver_user_id]);
-    if (recRes.rows.length === 0) {
-      return res.status(404).json({ error: 'Receiver user account not active.' });
-    }
-
-    const receiverId = recRes.rows[0].id;
 
     // Check sender balance
     const senderWalletRes = await db.query('SELECT balance, total_debits FROM wallets WHERE user_id = $1', [sender_id]);
@@ -451,17 +444,44 @@ router.post('/transfer-requests/approve', async (req, res) => {
       return res.status(400).json({ error: 'Sender has insufficient balance.' });
     }
 
+    const senderWallet = senderWalletRes.rows[0];
+    const newSenderBalance = parseFloat(senderWallet.balance) - numAmount;
+    const newSenderDebits = parseFloat(senderWallet.total_debits) + numAmount;
+
+    // SCENARIO A: If the receiver is external (outside of our wallet system)
+    if (receiver_user_id === 'EXTERNAL') {
+      // 1. Deduct sender's wallet
+      await db.query('UPDATE wallets SET balance = $1, total_debits = $2 WHERE user_id = $3', [newSenderBalance, newSenderDebits, sender_id]);
+
+      // 2. Approve request
+      await db.query('UPDATE transfer_requests SET status = \'APPROVED\', admin_id = $1, updated_at = NOW() WHERE id = $2', [adminId, id]);
+
+      // 3. Record transaction in ledger (receiver_id is null)
+      await db.query(
+        `INSERT INTO transactions (sender_id, receiver_id, amount, type, description, status, transaction_reference)
+         VALUES ($1, NULL, $2, 'TRANSFER', $3, 'COMPLETED', $4)`,
+        [sender_id, numAmount, `External manual transfer to address: ${receiver_wallet_address}`, receiver_wallet_address]
+      );
+
+      await logAudit(adminId, 'ADMIN', 'TRANSFER_REQUEST_APPROVAL_EXTERNAL', ip, `Approved external transfer of $${numAmount.toFixed(2)} from sender ID: ${sender_id} to address: ${receiver_wallet_address}`);
+
+      return res.json({ message: 'External transfer request approved successfully.' });
+    }
+
+    // Standard internal transfer:
+    const recRes = await db.query('SELECT id FROM users WHERE user_id = $1 AND role = \'USER\' AND status = \'ACTIVE\'', [receiver_user_id]);
+    if (recRes.rows.length === 0) {
+      return res.status(404).json({ error: 'Receiver user account not active.' });
+    }
+
+    const receiverId = recRes.rows[0].id;
+
     const receiverWalletRes = await db.query('SELECT balance, total_credits FROM wallets WHERE user_id = $1', [receiverId]);
     if (receiverWalletRes.rows.length === 0) {
       return res.status(404).json({ error: 'Receiver wallet not found.' });
     }
 
-    const senderWallet = senderWalletRes.rows[0];
     const receiverWallet = receiverWalletRes.rows[0];
-
-    const newSenderBalance = parseFloat(senderWallet.balance) - numAmount;
-    const newSenderDebits = parseFloat(senderWallet.total_debits) + numAmount;
-
     const newReceiverBalance = parseFloat(receiverWallet.balance) + numAmount;
     const newReceiverCredits = parseFloat(receiverWallet.total_credits) + numAmount;
 
@@ -775,10 +795,53 @@ router.post('/users/delete', async (req, res) => {
 
     const targetUserId = checkRole.rows[0].user_id;
 
+    // Check user balance first
+    const walletRes = await db.query('SELECT id, balance, total_debits FROM wallets WHERE user_id = $1', [id]);
+    let reclaimAmount = 0.00;
+    if (walletRes.rows.length > 0) {
+      reclaimAmount = parseFloat(walletRes.rows[0].balance);
+    }
+
+    if (reclaimAmount > 0) {
+      // 1. Reclaim to Admin Master Wallet
+      let adminWalletRes = await db.query('SELECT * FROM wallets WHERE user_id = $1', [adminId]);
+      if (adminWalletRes.rows.length === 0) {
+        await db.query('INSERT INTO wallets (user_id, balance) VALUES ($1, 0.00)', [adminId]);
+        adminWalletRes = await db.query('SELECT * FROM wallets WHERE user_id = $1', [adminId]);
+      }
+
+      const adminWallet = adminWalletRes.rows[0];
+      const newAdminBalance = parseFloat(adminWallet.balance) + reclaimAmount;
+      const newAdminCredits = parseFloat(adminWallet.total_credits) + reclaimAmount;
+
+      await db.query(
+        'UPDATE wallets SET balance = $1, total_credits = $2 WHERE user_id = $3',
+        [newAdminBalance, newAdminCredits, adminId]
+      );
+
+      // 2. Zero out user wallet balance
+      const userWallet = walletRes.rows[0];
+      const newUserDebits = parseFloat(userWallet.total_debits || 0) + reclaimAmount;
+      await db.query(
+        'UPDATE wallets SET balance = 0.00, total_debits = $1 WHERE id = $2',
+        [newUserDebits, userWallet.id]
+      );
+
+      // 3. Record transaction
+      const desc = `Reclaimed balance ($${reclaimAmount.toFixed(2)}) from deleted user ${targetUserId} to Admin Master Wallet`;
+      await db.query(
+        `INSERT INTO transactions (sender_id, receiver_id, amount, type, description, status)
+         VALUES ($1, $2, $3, 'TRANSFER', $4, 'COMPLETED')`,
+        [id, adminId, reclaimAmount, desc]
+      );
+
+      await logAudit(adminId, 'ADMIN', 'USER_DELETE_RECLAIM_FUNDS', ip, desc);
+    }
+
     await db.query('DELETE FROM users WHERE id = $1', [id]);
     await logAudit(adminId, 'ADMIN', 'DELETE_USER', ip, `Admin permanently deleted user account: ${targetUserId}`);
 
-    res.json({ message: 'User account has been permanently deleted.' });
+    res.json({ message: 'User account has been permanently deleted.', reclaimedAmount: reclaimAmount });
   } catch (err) {
     console.error('User Deletion Error:', err);
     res.status(500).json({ error: 'Server error.' });

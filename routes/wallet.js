@@ -225,23 +225,34 @@ router.post('/transfer-request', checkAMLRestrictions, async (req, res) => {
         [receiver_wallet_address]
       );
       if (lookup.rows.length === 0) {
-        return res.status(400).json({ error: 'Invalid or inactive receiver wallet address.' });
+        // External Address Support
+        if (!/^[a-zA-Z0-9_]{10,65}$/.test(receiver_wallet_address)) {
+          return res.status(400).json({ error: 'Invalid receiver wallet address format.' });
+        }
+        const ownWalletRes = await db.query('SELECT wallet_address FROM wallets WHERE user_id = $1', [userId]);
+        if (ownWalletRes.rows.length > 0 && ownWalletRes.rows[0].wallet_address === receiver_wallet_address) {
+          return res.status(400).json({ error: 'You cannot request transfers to your own wallet address.' });
+        }
+        targetUserId = 'EXTERNAL';
+      } else {
+        targetUserId = lookup.rows[0].user_id;
       }
-      targetUserId = lookup.rows[0].user_id;
     }
 
-    if (targetUserId === req.user.user_id) {
-      return res.status(400).json({ error: 'You cannot request transfers to yourself.' });
-    }
+    if (targetUserId !== 'EXTERNAL') {
+      if (targetUserId === req.user.user_id) {
+        return res.status(400).json({ error: 'You cannot request transfers to yourself.' });
+      }
 
-    const recRes = await db.query('SELECT id FROM users WHERE user_id = $1 AND role = \'USER\' AND status = \'ACTIVE\'', [targetUserId]);
-    if (recRes.rows.length === 0) {
-      return res.status(400).json({ error: 'Recipient User ID is invalid or account is not active.' });
+      const recRes = await db.query('SELECT id FROM users WHERE user_id = $1 AND role = \'USER\' AND status = \'ACTIVE\'', [targetUserId]);
+      if (recRes.rows.length === 0) {
+        return res.status(400).json({ error: 'Recipient User ID is invalid or account is not active.' });
+      }
     }
 
     await db.query(
-      'INSERT INTO transfer_requests (sender_id, receiver_user_id, amount, status) VALUES ($1, $2, $3, \'PENDING\')',
-      [userId, targetUserId, numAmount]
+      'INSERT INTO transfer_requests (sender_id, receiver_user_id, receiver_wallet_address, amount, status) VALUES ($1, $2, $3, $4, \'PENDING\')',
+      [userId, targetUserId, receiver_wallet_address || null, numAmount]
     );
 
     await logAudit(userId, 'USER', 'TRANSFER_REQUEST_SUBMITTED', ip, `Requested transfer of $${numAmount.toFixed(2)} to ${targetUserId}.`);
@@ -402,7 +413,15 @@ router.post('/verify-receiver', async (req, res) => {
     return res.status(400).json({ error: 'Wallet address is required.' });
   }
 
+  const userId = req.user.id;
+
   try {
+    // Check if it's the sender's own wallet address
+    const ownWalletRes = await db.query('SELECT wallet_address FROM wallets WHERE user_id = $1', [userId]);
+    if (ownWalletRes.rows.length > 0 && ownWalletRes.rows[0].wallet_address === wallet_address) {
+      return res.status(400).json({ error: 'You cannot request transfers to your own wallet address.' });
+    }
+
     const result = await db.query(
       `SELECT u.fullname, u.user_id, w.wallet_address 
        FROM wallets w
@@ -412,16 +431,22 @@ router.post('/verify-receiver', async (req, res) => {
     );
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Receiver wallet address not found or recipient account is not active.' });
+      // Validate wallet address format (alphanumeric, 10-65 chars)
+      if (!/^[a-zA-Z0-9_]{10,65}$/.test(wallet_address)) {
+        return res.status(400).json({ error: 'Invalid receiver wallet address format.' });
+      }
+      return res.json({
+        receiver: {
+          fullname: 'External Recipient (Manual Fulfillment)',
+          user_id: 'EXTERNAL',
+          wallet_address: wallet_address,
+          is_external: true
+        }
+      });
     }
 
     const receiver = result.rows[0];
-
-    if (receiver.user_id === req.user.user_id) {
-      return res.status(400).json({ error: 'You cannot request transfers to your own wallet address.' });
-    }
-
-    res.json({ receiver });
+    res.json({ receiver: { ...receiver, is_external: false } });
   } catch (err) {
     console.error('Verify Receiver Error:', err);
     res.status(500).json({ error: 'Server error.' });

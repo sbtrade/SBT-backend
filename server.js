@@ -52,6 +52,9 @@ async function seedSystemAccounts() {
     // Ensure wallet_address column exists in wallets table
     await db.query('ALTER TABLE wallets ADD COLUMN IF NOT EXISTS wallet_address VARCHAR(100) UNIQUE');
 
+    // Ensure receiver_wallet_address column exists in transfer_requests table
+    await db.query('ALTER TABLE transfer_requests ADD COLUMN IF NOT EXISTS receiver_wallet_address VARCHAR(255)');
+
     // Generate wallet addresses for any wallets missing one
     const missingWallets = await db.query('SELECT id FROM wallets WHERE wallet_address IS NULL');
     for (const w of missingWallets.rows) {
