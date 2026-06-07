@@ -719,4 +719,68 @@ router.post('/password-resets/reject', async (req, res) => {
   }
 });
 
+// 22. Suspend / Unsuspend User
+router.post('/users/suspend', async (req, res) => {
+  const { id, suspend } = req.body;
+  const adminId = req.user.id;
+  const ip = req.ip || '127.0.0.1';
+
+  if (!id) {
+    return res.status(400).json({ error: 'User database ID is required.' });
+  }
+
+  const newStatus = suspend ? 'SUSPENDED' : 'ACTIVE';
+  const actionText = suspend ? 'SUSPEND_USER' : 'UNSUSPEND_USER';
+
+  try {
+    // Prevent modifying admins/superadmins
+    const checkRole = await db.query('SELECT role, user_id FROM users WHERE id = $1', [id]);
+    if (checkRole.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found.' });
+    }
+    if (checkRole.rows[0].role !== 'USER') {
+      return res.status(403).json({ error: 'Administrative accounts cannot be suspended via this route.' });
+    }
+
+    await db.query('UPDATE users SET status = $1 WHERE id = $2', [newStatus, id]);
+    await logAudit(adminId, 'ADMIN', actionText, ip, `Admin set user ID ${checkRole.rows[0].user_id} status to ${newStatus}`);
+
+    res.json({ message: `User account has been ${newStatus.toLowerCase()}ed successfully.` });
+  } catch (err) {
+    console.error('User Suspension Error:', err);
+    res.status(500).json({ error: 'Server error.' });
+  }
+});
+
+// 23. Delete User Account
+router.post('/users/delete', async (req, res) => {
+  const { id } = req.body;
+  const adminId = req.user.id;
+  const ip = req.ip || '127.0.0.1';
+
+  if (!id) {
+    return res.status(400).json({ error: 'User database ID is required.' });
+  }
+
+  try {
+    const checkRole = await db.query('SELECT role, user_id FROM users WHERE id = $1', [id]);
+    if (checkRole.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found.' });
+    }
+    if (checkRole.rows[0].role !== 'USER') {
+      return res.status(403).json({ error: 'Administrative accounts cannot be deleted.' });
+    }
+
+    const targetUserId = checkRole.rows[0].user_id;
+
+    await db.query('DELETE FROM users WHERE id = $1', [id]);
+    await logAudit(adminId, 'ADMIN', 'DELETE_USER', ip, `Admin permanently deleted user account: ${targetUserId}`);
+
+    res.json({ message: 'User account has been permanently deleted.' });
+  } catch (err) {
+    console.error('User Deletion Error:', err);
+    res.status(500).json({ error: 'Server error.' });
+  }
+});
+
 module.exports = router;
