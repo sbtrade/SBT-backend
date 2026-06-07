@@ -4,6 +4,7 @@ const path = require('path');
 const fs = require('fs');
 const bcrypt = require('bcryptjs');
 const db = require('./config/db');
+const crypto = require('crypto');
 require('dotenv').config();
 
 const app = express();
@@ -47,6 +48,16 @@ async function seedSystemAccounts() {
   try {
     // Ensure parent_id column exists for user-admin assignments
     await db.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS parent_id INTEGER REFERENCES users(id) ON DELETE SET NULL');
+
+    // Ensure wallet_address column exists in wallets table
+    await db.query('ALTER TABLE wallets ADD COLUMN IF NOT EXISTS wallet_address VARCHAR(100) UNIQUE');
+
+    // Generate wallet addresses for any wallets missing one
+    const missingWallets = await db.query('SELECT id FROM wallets WHERE wallet_address IS NULL');
+    for (const w of missingWallets.rows) {
+      const generatedAddr = 'sbt_' + crypto.randomBytes(16).toString('hex');
+      await db.query('UPDATE wallets SET wallet_address = $1 WHERE id = $2', [generatedAddr, w.id]);
+    }
 
     // 1. Seed System Auditor
     const superCheck = await db.query("SELECT id FROM users WHERE user_id = 'SUPERADMIN001'");

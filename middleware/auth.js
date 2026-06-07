@@ -44,7 +44,11 @@ const authenticateToken = async (req, res, next) => {
 
     next();
   } catch (err) {
-    console.error('JWT Verification Error:', err);
+    if (err.name === 'TokenExpiredError') {
+      console.warn(`JWT Access Token Expired for IP: ${req.ip || '127.0.0.1'}`);
+    } else {
+      console.error('JWT Verification Error:', err);
+    }
     return res.status(403).json({ error: 'Invalid or expired access token.' });
   }
 };

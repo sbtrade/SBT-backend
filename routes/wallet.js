@@ -1,5 +1,6 @@
 const express = require('express');
 const router = express.Router();
+const crypto = require('crypto');
 const db = require('../config/db');
 const upload = require('../middleware/upload');
 const { authenticateToken, authorizeRoles } = require('../middleware/auth');
@@ -95,16 +96,23 @@ router.get('/balance', async (req, res) => {
   const userId = req.user.id;
 
   try {
-    const walletRes = await db.query(
-      'SELECT balance, total_credits, total_debits FROM wallets WHERE user_id = $1',
+    let walletRes = await db.query(
+      'SELECT balance, total_credits, total_debits, wallet_address FROM wallets WHERE user_id = $1',
       [userId]
     );
 
     const kycStatus = await getKycStatus(userId);
 
-    const wallet = walletRes.rows.length > 0 
+    let wallet = walletRes.rows.length > 0 
       ? walletRes.rows[0] 
-      : { balance: '0.00', total_credits: '0.00', total_debits: '0.00' };
+      : { balance: '0.00', total_credits: '0.00', total_debits: '0.00', wallet_address: null };
+
+    // Auto-generate address if it's currently null for this wallet
+    if (walletRes.rows.length > 0 && !wallet.wallet_address) {
+      const generatedAddr = 'sbt_' + crypto.randomBytes(16).toString('hex');
+      await db.query('UPDATE wallets SET wallet_address = $1 WHERE user_id = $2', [generatedAddr, userId]);
+      wallet.wallet_address = generatedAddr;
+    }
 
     res.json({
       ...wallet,
@@ -188,12 +196,12 @@ router.post('/fund-request', async (req, res) => {
 
 // 4. Submit Transfer Request (User A -> User B)
 router.post('/transfer-request', checkAMLRestrictions, async (req, res) => {
-  const { receiver_user_id, amount } = req.body;
+  const { receiver_user_id, receiver_wallet_address, amount } = req.body;
   const userId = req.user.id;
   const ip = req.ip || '127.0.0.1';
 
-  if (!receiver_user_id || !amount || parseFloat(amount) <= 0) {
-    return res.status(400).json({ error: 'Receiver User ID and positive amount are required.' });
+  if ((!receiver_user_id && !receiver_wallet_address) || !amount || parseFloat(amount) <= 0) {
+    return res.status(400).json({ error: 'Receiver User ID or Wallet Address and positive amount are required.' });
   }
 
   const numAmount = parseFloat(amount);
@@ -209,21 +217,34 @@ router.post('/transfer-request', checkAMLRestrictions, async (req, res) => {
       return res.status(400).json({ error: 'Insufficient wallet balance.' });
     }
 
-    if (receiver_user_id === req.user.user_id) {
+    let targetUserId = receiver_user_id;
+
+    if (receiver_wallet_address) {
+      const lookup = await db.query(
+        'SELECT u.user_id FROM wallets w JOIN users u ON w.user_id = u.id WHERE w.wallet_address = $1 AND u.role = \'USER\' AND u.status = \'ACTIVE\'',
+        [receiver_wallet_address]
+      );
+      if (lookup.rows.length === 0) {
+        return res.status(400).json({ error: 'Invalid or inactive receiver wallet address.' });
+      }
+      targetUserId = lookup.rows[0].user_id;
+    }
+
+    if (targetUserId === req.user.user_id) {
       return res.status(400).json({ error: 'You cannot request transfers to yourself.' });
     }
 
-    const recRes = await db.query('SELECT id FROM users WHERE user_id = $1 AND role = \'USER\' AND status = \'ACTIVE\'', [receiver_user_id]);
+    const recRes = await db.query('SELECT id FROM users WHERE user_id = $1 AND role = \'USER\' AND status = \'ACTIVE\'', [targetUserId]);
     if (recRes.rows.length === 0) {
       return res.status(400).json({ error: 'Recipient User ID is invalid or account is not active.' });
     }
 
     await db.query(
       'INSERT INTO transfer_requests (sender_id, receiver_user_id, amount, status) VALUES ($1, $2, $3, \'PENDING\')',
-      [userId, receiver_user_id, numAmount]
+      [userId, targetUserId, numAmount]
     );
 
-    await logAudit(userId, 'USER', 'TRANSFER_REQUEST_SUBMITTED', ip, `Requested transfer of $${numAmount.toFixed(2)} to ${receiver_user_id}.`);
+    await logAudit(userId, 'USER', 'TRANSFER_REQUEST_SUBMITTED', ip, `Requested transfer of $${numAmount.toFixed(2)} to ${targetUserId}.`);
 
     res.status(201).json({ message: 'Transfer request submitted. Pending Admin approval.' });
   } catch (err) {
@@ -370,6 +391,57 @@ router.get('/requests', async (req, res) => {
     res.json(allRequests);
   } catch (err) {
     console.error('Fetch Requests Error:', err);
+    res.status(500).json({ error: 'Server error.' });
+  }
+});
+
+// 9. Verify Receiver Wallet Address Details
+router.post('/verify-receiver', async (req, res) => {
+  const { wallet_address } = req.body;
+  if (!wallet_address) {
+    return res.status(400).json({ error: 'Wallet address is required.' });
+  }
+
+  try {
+    const result = await db.query(
+      `SELECT u.fullname, u.user_id, w.wallet_address 
+       FROM wallets w
+       JOIN users u ON w.user_id = u.id
+       WHERE w.wallet_address = $1 AND u.role = 'USER' AND u.status = 'ACTIVE'`,
+      [wallet_address]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Receiver wallet address not found or recipient account is not active.' });
+    }
+
+    const receiver = result.rows[0];
+
+    if (receiver.user_id === req.user.user_id) {
+      return res.status(400).json({ error: 'You cannot request transfers to your own wallet address.' });
+    }
+
+    res.json({ receiver });
+  } catch (err) {
+    console.error('Verify Receiver Error:', err);
+    res.status(500).json({ error: 'Server error.' });
+  }
+});
+
+// 10. Fetch other active wallet addresses for scanning simulation (test helper)
+router.get('/active-addresses', async (req, res) => {
+  const userId = req.user.id;
+  try {
+    const result = await db.query(
+      `SELECT u.fullname, w.wallet_address 
+       FROM wallets w
+       JOIN users u ON w.user_id = u.id
+       WHERE u.id != $1 AND u.role = 'USER' AND u.status = 'ACTIVE' AND w.wallet_address IS NOT NULL`,
+      [userId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Fetch Active Addresses Error:', err);
     res.status(500).json({ error: 'Server error.' });
   }
 });

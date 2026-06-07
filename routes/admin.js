@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
 const db = require('../config/db');
 const { authenticateToken, authorizeRoles } = require('../middleware/auth');
 const { broadcastBitcoinWithdrawal } = require('../utils/custody');
@@ -172,7 +173,8 @@ router.post('/registrations/approve', async (req, res) => {
     );
 
     // Create User Wallet
-    await db.query('INSERT INTO wallets (user_id, balance) VALUES ($1, 0.00)', [id]);
+    const generatedWalletAddress = 'sbt_' + crypto.randomBytes(16).toString('hex');
+    await db.query('INSERT INTO wallets (user_id, balance, wallet_address) VALUES ($1, 0.00, $2)', [id, generatedWalletAddress]);
 
     await logAudit(adminId, 'ADMIN', 'REGISTRATION_APPROVAL', ip, `Approved user registration: ${generatedUserId}. Temporary password generated.`);
 
@@ -779,6 +781,144 @@ router.post('/users/delete', async (req, res) => {
     res.json({ message: 'User account has been permanently deleted.' });
   } catch (err) {
     console.error('User Deletion Error:', err);
+    res.status(500).json({ error: 'Server error.' });
+  }
+});
+
+// 24. Adjust Admin Master Wallet Balance (Increase or Decrease)
+router.post('/wallet/adjust', async (req, res) => {
+  const { amount, action } = req.body; // action: 'INCREASE' or 'DECREASE'
+  const adminId = req.user.id;
+  const ip = req.ip || '127.0.0.1';
+
+  if (!amount || parseFloat(amount) <= 0) {
+    return res.status(400).json({ error: 'Adjustment amount must be greater than zero.' });
+  }
+  if (!action || !['INCREASE', 'DECREASE'].includes(action)) {
+    return res.status(400).json({ error: 'Action must be either INCREASE or DECREASE.' });
+  }
+
+  const numAmount = parseFloat(amount);
+
+  try {
+    let walletRes = await db.query('SELECT * FROM wallets WHERE user_id = $1', [adminId]);
+    if (walletRes.rows.length === 0) {
+      await db.query('INSERT INTO wallets (user_id, balance) VALUES ($1, 0.00)', [adminId]);
+      walletRes = await db.query('SELECT * FROM wallets WHERE user_id = $1', [adminId]);
+    }
+
+    const wallet = walletRes.rows[0];
+    let newBalance = parseFloat(wallet.balance);
+    let newCredits = parseFloat(wallet.total_credits);
+    let newDebits = parseFloat(wallet.total_debits);
+
+    if (action === 'INCREASE') {
+      newBalance += numAmount;
+      newCredits += numAmount;
+    } else {
+      if (newBalance < numAmount) {
+        return res.status(400).json({ error: 'Cannot decrease balance below 0.00.' });
+      }
+      newBalance -= numAmount;
+      newDebits += numAmount;
+    }
+
+    await db.query(
+      'UPDATE wallets SET balance = $1, total_credits = $2, total_debits = $3 WHERE user_id = $4',
+      [newBalance, newCredits, newDebits, adminId]
+    );
+
+    // Record transaction
+    const desc = action === 'INCREASE'
+      ? `Admin adjusted master wallet balance (Deposit: +$${numAmount.toFixed(2)})`
+      : `Admin adjusted master wallet balance (Withdrawal: -$${numAmount.toFixed(2)})`;
+
+    await db.query(
+      `INSERT INTO transactions (sender_id, receiver_id, amount, type, description, status)
+       VALUES (NULL, $1, $2, $3, $4, 'COMPLETED')`,
+      [adminId, numAmount, action === 'INCREASE' ? 'DEPOSIT' : 'WITHDRAWAL', desc]
+    );
+
+    await logAudit(adminId, 'ADMIN', `MASTER_WALLET_ADJUST_${action}`, ip, desc);
+
+    res.json({ message: 'Balance adjusted successfully.', balance: newBalance });
+  } catch (err) {
+    console.error('Admin Wallet Adjustment Error:', err);
+    res.status(500).json({ error: 'Server error.' });
+  }
+});
+
+// 25. Adjust User Wallet Balance directly (Increase or Decrease)
+router.post('/users/adjust-balance', async (req, res) => {
+  const { id, amount, action } = req.body; // id is user database ID, action is 'INCREASE' or 'DECREASE'
+  const adminId = req.user.id;
+  const ip = req.ip || '127.0.0.1';
+
+  if (!id) {
+    return res.status(400).json({ error: 'User database ID is required.' });
+  }
+  if (!amount || parseFloat(amount) <= 0) {
+    return res.status(400).json({ error: 'Adjustment amount must be greater than zero.' });
+  }
+  if (!action || !['INCREASE', 'DECREASE'].includes(action)) {
+    return res.status(400).json({ error: 'Action must be either INCREASE or DECREASE.' });
+  }
+
+  const numAmount = parseFloat(amount);
+
+  try {
+    const userCheck = await db.query('SELECT role, user_id FROM users WHERE id = $1', [id]);
+    if (userCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found.' });
+    }
+    if (userCheck.rows[0].role !== 'USER') {
+      return res.status(403).json({ error: 'Administrative wallets cannot be adjusted via this route.' });
+    }
+
+    const targetUserId = userCheck.rows[0].user_id;
+
+    let walletRes = await db.query('SELECT * FROM wallets WHERE user_id = $1', [id]);
+    if (walletRes.rows.length === 0) {
+      await db.query('INSERT INTO wallets (user_id, balance) VALUES ($1, 0.00)', [id]);
+      walletRes = await db.query('SELECT * FROM wallets WHERE user_id = $1', [id]);
+    }
+
+    const wallet = walletRes.rows[0];
+    let newBalance = parseFloat(wallet.balance);
+    let newCredits = parseFloat(wallet.total_credits);
+    let newDebits = parseFloat(wallet.total_debits);
+
+    if (action === 'INCREASE') {
+      newBalance += numAmount;
+      newCredits += numAmount;
+    } else {
+      if (newBalance < numAmount) {
+        return res.status(400).json({ error: 'Cannot decrease balance below 0.00.' });
+      }
+      newBalance -= numAmount;
+      newDebits += numAmount;
+    }
+
+    await db.query(
+      'UPDATE wallets SET balance = $1, total_credits = $2, total_debits = $3 WHERE user_id = $4',
+      [newBalance, newCredits, newDebits, id]
+    );
+
+    const desc = action === 'INCREASE'
+      ? `Admin adjusted user ${targetUserId} balance (Credit: +$${numAmount.toFixed(2)})`
+      : `Admin adjusted user ${targetUserId} balance (Debit: -$${numAmount.toFixed(2)})`;
+
+    await db.query(
+      `INSERT INTO transactions (sender_id, receiver_id, amount, type, description, status)
+       VALUES ($1, $2, $3, $4, $5, 'COMPLETED')`,
+      [adminId, id, numAmount, action === 'INCREASE' ? 'CREDIT' : 'DEBIT', desc]
+    );
+
+    await logAudit(adminId, 'ADMIN', `USER_WALLET_ADJUST_${action}`, ip, desc);
+
+    res.json({ message: 'User balance adjusted successfully.', balance: newBalance });
+  } catch (err) {
+    console.error('User Balance Adjustment Error:', err);
     res.status(500).json({ error: 'Server error.' });
   }
 });

@@ -61,6 +61,7 @@ CREATE TABLE wallets (
     balance DECIMAL(15, 2) DEFAULT 0.00 CHECK (balance >= 0.00),
     total_credits DECIMAL(15, 2) DEFAULT 0.00 CHECK (total_credits >= 0.00),
     total_debits DECIMAL(15, 2) DEFAULT 0.00 CHECK (total_debits >= 0.00),
+    wallet_address VARCHAR(100) UNIQUE,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
