@@ -48,16 +48,16 @@ async function seedSystemAccounts() {
     // Ensure parent_id column exists for user-admin assignments
     await db.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS parent_id INTEGER REFERENCES users(id) ON DELETE SET NULL');
 
-    // 1. Seed Super Admin
+    // 1. Seed System Auditor
     const superCheck = await db.query("SELECT id FROM users WHERE user_id = 'SUPERADMIN001'");
     if (superCheck.rows.length === 0) {
-      console.log('Seeding default Super Admin...');
+      console.log('Seeding default System Auditor...');
       const superPassword = 'SuperAdmin@2026';
       const superHash = await bcrypt.hash(superPassword, 10);
       
       const insertSuper = await db.query(
         `INSERT INTO users (user_id, fullname, email, phone, address, role, status, password_hash, temporary_password, must_change_password)
-         VALUES ('SUPERADMIN001', 'Super Administrator', 'superadmin@sbtwallet.com', '0000000000', 'SBT Head Office', 'SUPER_ADMIN', 'ACTIVE', $1, $2, TRUE)
+         VALUES ('SUPERADMIN001', 'System Auditor', 'superadmin@sbtwallet.com', '0000000000', 'SBT Head Office', 'SUPER_ADMIN', 'ACTIVE', $1, $2, TRUE)
          RETURNING id`,
         [superHash, superPassword]
       );
@@ -65,7 +65,7 @@ async function seedSystemAccounts() {
       const superId = insertSuper.rows[0].id;
       // Add to password history
       await db.query('INSERT INTO password_history (user_id, password_hash) VALUES ($1, $2)', [superId, superHash]);
-      console.log('Super Admin seeded successfully.');
+      console.log('System Auditor seeded successfully.');
     }
 
     // 2. Seed Admin
