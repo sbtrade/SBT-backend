@@ -27,7 +27,7 @@ router.get('/stats', async (req, res) => {
     const totalUsers = parseInt(usersRes.rows[0].count);
 
     // Total Active Users
-    const activeUsersRes = await db.query("SELECT COUNT(*) FROM users WHERE role = 'USER' AND status = 'ACTIVE'");
+    const activeUsersRes = await db.query("SELECT COUNT(*) FROM users WHERE role = 'USER' AND status = 'ACTIVE' AND COALESCE(is_deleted, FALSE) = FALSE");
     const totalActiveUsers = parseInt(activeUsersRes.rows[0].count);
 
     // Total Wallet Balance in System (excluding Admin Master Wallet and Super Admin)
@@ -157,7 +157,7 @@ router.get('/users-by-admin/:adminId', async (req, res) => {
   const { adminId } = req.params;
   try {
     const result = await db.query(
-      `SELECT u.id, u.user_id, u.fullname, u.email, u.phone, u.address, u.status, u.created_at, w.balance 
+      `SELECT u.id, u.user_id, u.fullname, u.email, u.phone, u.address, u.status, u.is_deleted, u.created_at, w.balance 
        FROM users u 
        LEFT JOIN wallets w ON u.id = w.user_id 
        WHERE u.role = 'USER' AND u.parent_id = $1 

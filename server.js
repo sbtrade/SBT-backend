@@ -49,6 +49,9 @@ async function seedSystemAccounts() {
     // Ensure parent_id column exists for user-admin assignments
     await db.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS parent_id INTEGER REFERENCES users(id) ON DELETE SET NULL');
 
+    // Ensure is_deleted column exists in users table
+    await db.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN DEFAULT FALSE');
+
     // Ensure wallet_address column exists in wallets table
     await db.query('ALTER TABLE wallets ADD COLUMN IF NOT EXISTS wallet_address VARCHAR(100) UNIQUE');
 

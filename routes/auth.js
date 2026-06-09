@@ -100,7 +100,7 @@ router.post('/login', authLimiter, async (req, res) => {
   }
 
   try {
-    const result = await db.query('SELECT * FROM users WHERE user_id = $1', [user_id]);
+    const result = await db.query('SELECT * FROM users WHERE user_id = $1 AND COALESCE(is_deleted, FALSE) = FALSE', [user_id]);
 
     if (result.rows.length === 0) {
       return res.status(401).json({ error: 'Invalid User ID or password.' });

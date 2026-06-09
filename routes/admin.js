@@ -41,12 +41,33 @@ router.get('/users', async (req, res) => {
       `SELECT u.id, u.user_id, u.fullname, u.email, u.phone, u.address, u.status, u.created_at, w.balance 
        FROM users u 
        LEFT JOIN wallets w ON u.id = w.user_id 
-       WHERE u.role = 'USER' 
+       WHERE u.role = 'USER' AND COALESCE(u.is_deleted, FALSE) = FALSE
        ORDER BY u.created_at DESC`
     );
     res.json(result.rows);
   } catch (err) {
     console.error('Fetch Users Error:', err);
+    res.status(500).json({ error: 'Server error.' });
+  }
+});
+
+// 1b. Get KYC for a specific user database ID
+router.get('/users/:id/kyc', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const result = await db.query(
+      `SELECT id, front_id_url, back_id_url, status, remarks, created_at, updated_at 
+       FROM kyc_documents 
+       WHERE user_id = $1 
+       ORDER BY created_at DESC LIMIT 1`,
+      [id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'No KYC documents found for this user.' });
+    }
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Fetch User KYC Error:', err);
     res.status(500).json({ error: 'Server error.' });
   }
 });
@@ -785,8 +806,8 @@ router.post('/users/delete', async (req, res) => {
   }
 
   try {
-    const checkRole = await db.query('SELECT role, user_id FROM users WHERE id = $1', [id]);
-    if (checkRole.rows.length === 0) {
+    const checkRole = await db.query('SELECT role, user_id, is_deleted FROM users WHERE id = $1', [id]);
+    if (checkRole.rows.length === 0 || checkRole.rows[0].is_deleted) {
       return res.status(404).json({ error: 'User not found.' });
     }
     if (checkRole.rows[0].role !== 'USER') {
@@ -838,10 +859,10 @@ router.post('/users/delete', async (req, res) => {
       await logAudit(adminId, 'ADMIN', 'USER_DELETE_RECLAIM_FUNDS', ip, desc);
     }
 
-    await db.query('DELETE FROM users WHERE id = $1', [id]);
-    await logAudit(adminId, 'ADMIN', 'DELETE_USER', ip, `Admin permanently deleted user account: ${targetUserId}`);
+    await db.query('UPDATE users SET is_deleted = TRUE, status = \'SUSPENDED\' WHERE id = $1', [id]);
+    await logAudit(adminId, 'ADMIN', 'DELETE_USER', ip, `Admin soft-deleted user account: ${targetUserId}`);
 
-    res.json({ message: 'User account has been permanently deleted.', reclaimedAmount: reclaimAmount });
+    res.json({ message: 'User account has been deleted.', reclaimedAmount: reclaimAmount });
   } catch (err) {
     console.error('User Deletion Error:', err);
     res.status(500).json({ error: 'Server error.' });
@@ -930,8 +951,8 @@ router.post('/users/adjust-balance', async (req, res) => {
   const numAmount = parseFloat(amount);
 
   try {
-    const userCheck = await db.query('SELECT role, user_id FROM users WHERE id = $1', [id]);
-    if (userCheck.rows.length === 0) {
+    const userCheck = await db.query('SELECT role, user_id, is_deleted FROM users WHERE id = $1', [id]);
+    if (userCheck.rows.length === 0 || userCheck.rows[0].is_deleted) {
       return res.status(404).json({ error: 'User not found.' });
     }
     if (userCheck.rows[0].role !== 'USER') {

@@ -426,7 +426,7 @@ router.post('/verify-receiver', async (req, res) => {
       `SELECT u.fullname, u.user_id, w.wallet_address 
        FROM wallets w
        JOIN users u ON w.user_id = u.id
-       WHERE w.wallet_address = $1 AND u.role = 'USER' AND u.status = 'ACTIVE'`,
+       WHERE w.wallet_address = $1 AND u.role = 'USER' AND u.status = 'ACTIVE' AND COALESCE(u.is_deleted, FALSE) = FALSE`,
       [wallet_address]
     );
 
@@ -461,7 +461,7 @@ router.get('/active-addresses', async (req, res) => {
       `SELECT u.fullname, w.wallet_address 
        FROM wallets w
        JOIN users u ON w.user_id = u.id
-       WHERE u.id != $1 AND u.role = 'USER' AND u.status = 'ACTIVE' AND w.wallet_address IS NOT NULL`,
+       WHERE u.id != $1 AND u.role = 'USER' AND u.status = 'ACTIVE' AND w.wallet_address IS NOT NULL AND COALESCE(u.is_deleted, FALSE) = FALSE`,
       [userId]
     );
     res.json(result.rows);
