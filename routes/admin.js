@@ -77,11 +77,13 @@ router.get('/users/:id/transactions', async (req, res) => {
   const { id } = req.params;
   try {
     const result = await db.query(
-      `SELECT t.id, t.amount, t.type, t.description, t.status, t.tx_hash, t.created_at, t.aml_flagged, t.payment_id, t.btc_amount, t.transaction_reference,
-              u1.user_id AS sender_id_str, u2.user_id AS receiver_id_str
+      `SELECT t.id, t.amount, t.type, t.description, t.status, t.tx_hash, t.created_at, t.aml_flagged, t.payment_id, t.transaction_reference,
+              u1.user_id AS sender_id_str, u2.user_id AS receiver_id_str,
+              wr.btc_amount
        FROM transactions t
        LEFT JOIN users u1 ON t.sender_id = u1.id
        LEFT JOIN users u2 ON t.receiver_id = u2.id
+       LEFT JOIN withdrawal_requests wr ON t.tx_hash = wr.tx_hash AND t.type = 'WITHDRAWAL'
        WHERE t.sender_id = $1 OR t.receiver_id = $1
        ORDER BY t.created_at DESC`,
       [id]
