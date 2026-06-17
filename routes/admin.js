@@ -72,6 +72,27 @@ router.get('/users/:id/kyc', async (req, res) => {
   }
 });
 
+// 1c. Get transaction history for a specific user database ID
+router.get('/users/:id/transactions', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const result = await db.query(
+      `SELECT t.id, t.amount, t.type, t.description, t.status, t.tx_hash, t.created_at, t.aml_flagged, t.payment_id, t.btc_amount, t.transaction_reference,
+              u1.user_id AS sender_id_str, u2.user_id AS receiver_id_str
+       FROM transactions t
+       LEFT JOIN users u1 ON t.sender_id = u1.id
+       LEFT JOIN users u2 ON t.receiver_id = u2.id
+       WHERE t.sender_id = $1 OR t.receiver_id = $1
+       ORDER BY t.created_at DESC`,
+      [id]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Fetch User Transactions Error:', err);
+    res.status(500).json({ error: 'Server error.' });
+  }
+});
+
 // 2. Deposit into Admin Master Wallet
 router.post('/deposit', async (req, res) => {
   const { amount } = req.body;
