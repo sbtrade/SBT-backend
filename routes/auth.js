@@ -6,6 +6,7 @@ const crypto = require('crypto');
 const db = require('../config/db');
 const { authLimiter } = require('../middleware/rateLimiter');
 const { authenticateToken } = require('../middleware/auth');
+const { sendSMS } = require('../utils/sms');
 
 const JWT_ACCESS_SECRET = process.env.JWT_ACCESS_SECRET || 'super_secret_access_key_change_me_in_production_12345';
 const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || 'super_secret_refresh_key_change_me_in_production_12345';
@@ -39,6 +40,96 @@ function generateOTP() {
   return Math.floor(100000 + Math.random() * 900000).toString();
 }
 
+// In-memory OTP storage for registration flows
+const registrationOTPs = new Map();
+
+// In-memory OTP storage for profile password update flows
+const profilePasswordOTPs = new Map();
+
+// 1a. Send Registration OTP Route
+router.post('/register/send-otp', authLimiter, async (req, res) => {
+  const { phone } = req.body;
+  
+  if (!phone || !/^\d{10}$/.test(phone)) {
+    return res.status(400).json({ error: 'Phone number must be exactly 10 digits.' });
+  }
+
+  try {
+    // Check if phone number is already registered
+    const userCheck = await db.query('SELECT id, status FROM users WHERE phone = $1', [phone]);
+    if (userCheck.rows.length > 0) {
+      const status = userCheck.rows[0].status;
+      if (status === 'PENDING_APPROVAL') {
+        return res.status(400).json({ error: "Waiting for the admin's approval." });
+      }
+      return res.status(400).json({ error: 'This phone number is already registered.' });
+    }
+
+    const otpCode = generateOTP();
+    const expiresAt = Date.now() + 5 * 60 * 1000; // 5 min expiry
+
+    registrationOTPs.set(phone, { otp: otpCode, expiresAt, attempts: 0, verified: false });
+
+    console.log(`\n--- [REGISTRATION OTP ENGINE] OTP GENERATED FOR PHONE [${phone}] ---`);
+    console.log(`Registration Verification Code: ${otpCode}`);
+    console.log(`Expiry: 5 minutes\n------------------------------------------------------------\n`);
+
+    // Send actual SMS
+    await sendSMS(phone, `SBT Wallet Registration OTP: ${otpCode}. This code expires in 5 minutes.`);
+
+    res.json({ message: 'Verification OTP sent successfully.' });
+  } catch (err) {
+    console.error('Send Registration OTP Error:', err);
+    res.status(500).json({ error: 'Internal server error.' });
+  }
+});
+
+// 1b. Verify Registration OTP Route
+router.post('/register/verify-otp', authLimiter, async (req, res) => {
+  const { phone, otp } = req.body;
+
+  if (!phone || !otp) {
+    return res.status(400).json({ error: 'Phone number and OTP code are required.' });
+  }
+
+  const data = registrationOTPs.get(phone);
+  if (!data) {
+    return res.status(400).json({ error: 'No active OTP verification session found for this phone number.' });
+  }
+
+  if (Date.now() > data.expiresAt) {
+    registrationOTPs.delete(phone);
+    return res.status(400).json({ error: 'OTP code has expired. Please request a new one.' });
+  }
+
+  if (data.attempts >= 3) {
+    registrationOTPs.delete(phone);
+    return res.status(400).json({ error: 'Maximum attempts exceeded. Please request a new OTP.' });
+  }
+
+  if (data.otp !== otp.trim()) {
+    data.attempts += 1;
+    registrationOTPs.set(phone, data);
+    return res.status(400).json({ error: `Invalid verification code. Attempts: ${data.attempts}/3` });
+  }
+
+  // Success: mark as verified
+  registrationOTPs.set(phone, {
+    verified: true,
+    expiresAt: Date.now() + 10 * 60 * 1000 // Allow 10 min to submit registration form
+  });
+
+  res.json({ message: 'Phone number verified successfully.' });
+});
+
+// 1c. Debug Registration OTP Route
+router.get('/debug/register-otps/:phone', async (req, res) => {
+  const { phone } = req.params;
+  const data = registrationOTPs.get(phone);
+  if (!data) return res.status(404).json({ error: 'No OTP generated for this phone' });
+  res.json({ email_otp: data.otp, sms_otp: data.otp, expires_at: new Date(data.expiresAt) });
+});
+
 // 1. Register Account Route
 router.post('/register', authLimiter, async (req, res) => {
   const { fullname, phone, email, address, password } = req.body;
@@ -56,31 +147,46 @@ router.post('/register', authLimiter, async (req, res) => {
   if (!address || address.length < 10) {
     return res.status(400).json({ error: 'Address must be at least 10 characters.' });
   }
-  if (!password || password.length < 8) {
-    return res.status(400).json({ error: 'Password must be at least 8 characters.' });
-  }
 
   try {
+    // Phone OTP check stopped as requested - allowing direct registration pending admin approval
+    // const verification = registrationOTPs.get(phone);
+    // if (!verification || !verification.verified || Date.now() > verification.expiresAt) {
+    //   return res.status(400).json({ error: 'Phone number must be verified via OTP first.' });
+    // }
+
     const userCheck = await db.query('SELECT id FROM users WHERE email = $1 OR phone = $2', [email, phone]);
     if (userCheck.rows.length > 0) {
       return res.status(400).json({ error: 'Email or phone number is already registered.' });
     }
 
-    const hashedPassword = await bcrypt.hash(password, 10);
+    // Hash user-provided password or generate secure placeholder
+    let hashedPassword;
+    let mustChangePassword = true;
+    if (password && password.length >= 8) {
+      hashedPassword = await bcrypt.hash(password, 10);
+      mustChangePassword = false;
+    } else {
+      const placeholderPass = crypto.randomBytes(32).toString('hex');
+      hashedPassword = await bcrypt.hash(placeholderPass, 10);
+    }
     const userIdSeed = 'USR' + Math.floor(1000 + Math.random() * 9000);
 
     const result = await db.query(
       `INSERT INTO users (user_id, fullname, email, phone, address, role, status, password_hash, must_change_password)
-       VALUES ($1, $2, $3, $4, $5, 'USER', 'PENDING_APPROVAL', $6, FALSE) RETURNING id, user_id`,
-      [userIdSeed, fullname, email, phone, address, hashedPassword]
+       VALUES ($1, $2, $3, $4, $5, 'USER', 'PENDING_APPROVAL', $6, $7) RETURNING id, user_id`,
+      [userIdSeed, fullname, email, phone, address, hashedPassword, mustChangePassword]
     );
 
     const newUser = result.rows[0];
     await db.query('INSERT INTO password_history (user_id, password_hash) VALUES ($1, $2)', [newUser.id, hashedPassword]);
     await logAudit(newUser.id, 'USER', 'ACCOUNT_REGISTRATION', ip, `User registered with User ID: ${newUser.user_id}`);
 
+    // Clear verification session if any
+    registrationOTPs.delete(phone);
+
     res.status(201).json({
-      message: 'Registration submitted successfully. Pending Admin approval.',
+      message: 'Registration submitted successfully. Waiting for Admin approval.',
       user_id: newUser.user_id
     });
   } catch (err) {
@@ -130,18 +236,18 @@ router.post('/login', authLimiter, async (req, res) => {
     const isMatch = await bcrypt.compare(password, user.password_hash);
     if (!isMatch) {
       const failedCount = user.failed_login_attempts + 1;
-      if (failedCount >= 5) {
-        const lockoutTime = new Date(Date.now() + 30 * 60 * 1000); // 30 minutes
+      if (failedCount >= 3) {
+        const lockoutTime = new Date(Date.now() + 60 * 1000); // 1 minute lockout
         await db.query(
-          'UPDATE users SET failed_login_attempts = $1, account_locked_until = $2 WHERE id = $3',
-          [failedCount, lockoutTime, user.id]
+          'UPDATE users SET failed_login_attempts = 0, account_locked_until = $1 WHERE id = $2',
+          [lockoutTime, user.id]
         );
-        await logAudit(user.id, user.role, 'ACCOUNT_LOCKOUT', ip, `Account locked due to 5 failed attempts.`);
-        return res.status(403).json({ error: 'Account locked for 30 minutes due to 5 consecutive failed login attempts.' });
+        await logAudit(user.id, user.role, 'ACCOUNT_LOCKOUT_1MIN', ip, `Account locked for 1 min due to 3 failed attempts.`);
+        return res.status(403).json({ error: 'Account is locked for 1 minute due to 3 consecutive failed login attempts.' });
       } else {
         await db.query('UPDATE users SET failed_login_attempts = $1 WHERE id = $2', [failedCount, user.id]);
-        await logAudit(user.id, user.role, 'FAILED_LOGIN_ATTEMPT', ip, `Failed login attempt ${failedCount}/5`);
-        return res.status(401).json({ error: 'Invalid User ID or password.' });
+        await logAudit(user.id, user.role, 'FAILED_LOGIN_ATTEMPT', ip, `Failed login attempt ${failedCount}/3`);
+        return res.status(401).json({ error: `Invalid credentials. Attempt ${failedCount}/3 before 1-minute lockout.` });
       }
     }
 
@@ -167,6 +273,11 @@ router.post('/login', authLimiter, async (req, res) => {
       console.log(`\n--- [2FA ENGINE] OTP GENERATED FOR ADMINISTRATIVE USER [${user.user_id}] ---`);
       console.log(`Your 2FA Login Code: ${twoFactorOtp}`);
       console.log(`Expiry: 5 minutes\n------------------------------------------------------------\n`);
+
+      // Send actual SMS code to phone
+      if (user.phone) {
+        await sendSMS(user.phone, `SBT Wallet Secure 2FA Login Code: ${twoFactorOtp}. This code expires in 5 minutes.`);
+      }
 
       // Generate a temporary restricted token
       const tempToken = jwt.sign(
@@ -440,24 +551,27 @@ router.post('/logout', async (req, res) => {
 
 // 7. Forgot Password Request
 router.post('/forgot-password/request', async (req, res) => {
-  const { user_id, email, phone } = req.body;
+  const { user_id } = req.body;
   const ip = req.ip || '127.0.0.1';
 
-  if (!user_id || !email || !phone) {
-    return res.status(400).json({ error: 'All fields are required.' });
+  if (!user_id) {
+    return res.status(400).json({ error: 'User ID is required.' });
   }
 
   try {
     const userRes = await db.query(
-      'SELECT id, role, password_reset_count FROM users WHERE user_id = $1 AND email = $2 AND phone = $3',
-      [user_id, email, phone]
+      'SELECT id, role, password_reset_count, email, phone FROM users WHERE UPPER(user_id) = $1 AND COALESCE(is_deleted, FALSE) = FALSE',
+      [user_id.trim().toUpperCase()]
     );
 
     if (userRes.rows.length === 0) {
-      return res.status(400).json({ error: 'Invalid details provided.' });
+      return res.status(400).json({ error: 'No account found with this User ID.' });
     }
 
     const user = userRes.rows[0];
+    if (!user.phone) {
+      return res.status(400).json({ error: 'No registered phone number found for this account.' });
+    }
 
     if (user.password_reset_count >= 2) {
       const requestRes = await db.query(
@@ -476,27 +590,30 @@ router.post('/forgot-password/request', async (req, res) => {
       });
     }
 
-    const emailOtp = generateOTP();
-    const smsOtp = generateOTP();
+    const otpCode = generateOTP();
     const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
 
     await db.query('DELETE FROM otp_verifications WHERE user_id = $1', [user.id]);
     await db.query(
-      'INSERT INTO otp_verifications (user_id, email_otp, sms_otp, expires_at) VALUES ($1, $2, $3, $4)',
-      [user.id, emailOtp, smsOtp, expiresAt]
+      'INSERT INTO otp_verifications (user_id, email_otp, sms_otp, expires_at) VALUES ($1, $2, $2, $3)',
+      [user.id, otpCode, expiresAt]
     );
 
-    console.log(`\n--- REAL-TIME OTP GENERATOR LOG FOR USER [${user_id}] ---`);
-    console.log(`Email OTP Code: ${emailOtp}`);
-    console.log(`SMS OTP Code: ${smsOtp}`);
+    console.log(`\n--- REAL-TIME OTP GENERATOR LOG FOR USER ID [${user_id}] ---`);
+    console.log(`Forgot Password Mobile OTP: ${otpCode}`);
     console.log(`Expiry: 5 minutes\n--------------------------------------------\n`);
 
-    await logAudit(user.id, user.role, 'OTP_CODES_GENERATED', ip, 'Verification codes generated for password reset.');
+    // Send actual SMS code to phone
+    await sendSMS(user.phone, `SBT Wallet Password Reset OTP: ${otpCode}. This code is valid for 5 minutes. Do not share it with anyone.`);
+
+    await logAudit(user.id, user.role, 'OTP_CODES_GENERATED', ip, 'Verification code generated for password reset.');
+
+    // Mask phone number for security
+    const maskedPhone = user.phone.replace(/.(?=.{4})/g, '*');
 
     res.json({
-      message: 'OTPs sent successfully to your registered email and phone number.',
-      expires_in_seconds: 300,
-      debug_otp_logs: { emailOtp, smsOtp }
+      message: `OTP sent successfully to your registered mobile phone ending in ${user.phone.slice(-4)}.`,
+      expires_in_seconds: 300
     });
   } catch (err) {
     console.error('Forgot Password Request Error:', err);
@@ -506,15 +623,26 @@ router.post('/forgot-password/request', async (req, res) => {
 
 // 8. Forgot Password Verify & Reset
 router.post('/forgot-password/verify', authLimiter, async (req, res) => {
-  const { user_id, email_otp, sms_otp } = req.body;
+  const { user_id, otp_code, new_password } = req.body;
   const ip = req.ip || '127.0.0.1';
 
-  if (!user_id || !email_otp || !sms_otp) {
-    return res.status(400).json({ error: 'User ID and both OTP codes are required.' });
+  if (!user_id || !otp_code || !new_password) {
+    return res.status(400).json({ error: 'User ID, OTP code, and new password are required.' });
+  }
+
+  if (new_password.length < 8) {
+    return res.status(400).json({ error: 'New password must be at least 8 characters.' });
+  }
+
+  const passwordRegex = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[!@#$%^&*])/;
+  if (!passwordRegex.test(new_password)) {
+    return res.status(400).json({
+      error: 'Password must contain at least one uppercase letter, one lowercase letter, one number, and one special character (e.g. SBTWallet@2026).'
+    });
   }
 
   try {
-    const userRes = await db.query('SELECT id, role, password_reset_count FROM users WHERE user_id = $1', [user_id]);
+    const userRes = await db.query('SELECT id, role, password_reset_count FROM users WHERE UPPER(user_id) = $1', [user_id.trim().toUpperCase()]);
     if (userRes.rows.length === 0) {
       return res.status(400).json({ error: 'Invalid User ID.' });
     }
@@ -534,47 +662,52 @@ router.post('/forgot-password/verify', authLimiter, async (req, res) => {
 
     if (otpData.attempts >= 3) {
       await db.query('DELETE FROM otp_verifications WHERE id = $1', [otpData.id]);
-      return res.status(400).json({ error: 'Maximum attempts reached. Please request new OTP codes.' });
+      return res.status(400).json({ error: 'Maximum attempts reached. Please request a new OTP code.' });
     }
 
     if (new Date(otpData.expires_at) < new Date()) {
       await db.query('DELETE FROM otp_verifications WHERE id = $1', [otpData.id]);
-      return res.status(400).json({ error: 'OTP codes have expired.' });
+      return res.status(400).json({ error: 'OTP code has expired.' });
     }
 
-    const isEmailValid = otpData.email_otp === email_otp;
-    const isSmsValid = otpData.sms_otp === sms_otp;
-
-    if (!isEmailValid || !isSmsValid) {
+    const isOtpValid = otpData.sms_otp === otp_code || otpData.email_otp === otp_code;
+    if (!isOtpValid) {
       await db.query('UPDATE otp_verifications SET attempts = attempts + 1 WHERE id = $1', [otpData.id]);
       await logAudit(user.id, user.role, 'OTP_VERIFICATION_FAILED', ip, `Incorrect OTP input. Attempt ${otpData.attempts + 1}/3`);
-      return res.status(400).json({ error: 'Incorrect Email OTP or SMS OTP code.' });
+      return res.status(400).json({ error: 'Incorrect OTP code.' });
+    }
+
+    // Success: verify history
+    const historyRes = await db.query('SELECT password_hash FROM password_history WHERE user_id = $1 ORDER BY created_at DESC LIMIT 5', [user.id]);
+    for (let row of historyRes.rows) {
+      const isReused = await bcrypt.compare(new_password, row.password_hash);
+      if (isReused) {
+        return res.status(400).json({ error: 'You cannot reuse any of your last 5 passwords.' });
+      }
     }
 
     await db.query('DELETE FROM otp_verifications WHERE id = $1', [otpData.id]);
     
-    const tempPassword = generateTempPassword();
-    const tempHash = await bcrypt.hash(tempPassword, 10);
+    const newHash = await bcrypt.hash(new_password, 10);
     const newResetCount = user.password_reset_count + 1;
 
     await db.query(
       `UPDATE users 
        SET password_hash = $1, 
-           temporary_password = $2, 
-           temporary_password_created_at = NOW(), 
-           must_change_password = TRUE, 
-           password_reset_count = $3 
-       WHERE id = $4`,
-      [tempHash, tempPassword, newResetCount, user.id]
+           temporary_password = NULL, 
+           temporary_password_created_at = NULL, 
+           must_change_password = FALSE, 
+           password_reset_count = $2 
+       WHERE id = $3`,
+      [newHash, newResetCount, user.id]
     );
 
-    await db.query('INSERT INTO password_history (user_id, password_hash) VALUES ($1, $2)', [user.id, tempHash]);
-    await logAudit(user.id, user.role, 'TEMPORARY_PASSWORD_GENERATED', ip, 'Forgot Password verification succeeded. Temporary password generated.');
+    await db.query('INSERT INTO password_history (user_id, password_hash) VALUES ($1, $2)', [user.id, newHash]);
+    await logAudit(user.id, user.role, 'PASSWORD_RESET_SUCCESSFUL', ip, 'Forgot Password verification succeeded. Password updated directly.');
 
     res.json({
-      message: 'OTP verification successful.',
-      temporary_password: tempPassword,
-      must_change_password: true
+      message: 'Password reset successful. Please log in with your new password.',
+      must_change_password: false
     });
   } catch (err) {
     console.error('OTP Verification Error:', err);
@@ -593,6 +726,177 @@ router.get('/debug/otps/:user_id', async (req, res) => {
     if (otpRes.rows.length === 0) return res.status(404).json({ error: 'No OTP generated' });
 
     res.json(otpRes.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// 9c. Debug OTP by Phone Endpoint
+router.get('/debug/otps-by-phone/:phone', async (req, res) => {
+  const { phone } = req.params;
+  try {
+    const userRes = await db.query('SELECT id FROM users WHERE phone = $1', [phone]);
+    if (userRes.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+
+    const otpRes = await db.query('SELECT email_otp, sms_otp, expires_at FROM otp_verifications WHERE user_id = $1', [userRes.rows[0].id]);
+    if (otpRes.rows.length === 0) return res.status(404).json({ error: 'No OTP generated' });
+
+    res.json(otpRes.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// 10. Public System Settings retrieval route
+router.get('/settings', async (req, res) => {
+  try {
+    const settings = await db.query('SELECT setting_key, setting_value FROM system_settings');
+    const config = {};
+    settings.rows.forEach(row => {
+      config[row.setting_key] = row.setting_value;
+    });
+    res.json({
+      active_currency: config.active_currency || 'USD',
+      exchange_rates: config.exchange_rates ? JSON.parse(config.exchange_rates) : { USD: 1.0 }
+    });
+  } catch (err) {
+    console.error('Fetch System Settings Error:', err);
+    res.json({ active_currency: 'USD', exchange_rates: { USD: 1.0 } }); // Safe fallback
+  }
+});
+
+// 11. Fetch Logged-In User Profile Details
+router.get('/profile', authenticateToken, async (req, res) => {
+  const userId = req.user.id;
+  try {
+    const userRes = await db.query(
+      'SELECT id, user_id, fullname, email, phone, status, role, address FROM users WHERE id = $1',
+      [userId]
+    );
+    if (userRes.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found.' });
+    }
+    const user = userRes.rows[0];
+
+    const kycRes = await db.query(
+      'SELECT status, remarks, created_at FROM kyc_documents WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1',
+      [userId]
+    );
+    const kyc = kycRes.rows[0] || null;
+
+    res.json({
+      user,
+      kyc
+    });
+  } catch (err) {
+    console.error('Fetch profile error:', err);
+    res.status(500).json({ error: 'Server error.' });
+  }
+});
+
+// 12. Send OTP for logged-in user profile password changes
+router.post('/profile/password-otp/send', authenticateToken, async (req, res) => {
+  const userId = req.user.id;
+  try {
+    const userRes = await db.query('SELECT phone FROM users WHERE id = $1', [userId]);
+    if (userRes.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found.' });
+    }
+    const phone = userRes.rows[0].phone;
+    if (!phone) {
+      return res.status(400).json({ error: 'User does not have a phone number registered.' });
+    }
+
+    const otpCode = generateOTP();
+    const expiresAt = Date.now() + 5 * 60 * 1000; // 5 min expiry
+
+    profilePasswordOTPs.set(userId, { otp: otpCode, expiresAt });
+
+    console.log(`\n--- [PROFILE PASSWORD UPDATE OTP] OTP GENERATED FOR USER ID [${userId}] ---`);
+    console.log(`Password Update Code: ${otpCode}`);
+    console.log(`Expiry: 5 minutes\n------------------------------------------------------------\n`);
+
+    await sendSMS(phone, `SBT Wallet: Your password update OTP is ${otpCode}. This code is valid for 5 minutes.`);
+    res.json({ message: 'Password update verification OTP sent to your registered phone number.' });
+  } catch (err) {
+    console.error('Send profile password OTP error:', err);
+    res.status(500).json({ error: 'Server error.' });
+  }
+});
+
+// 13. Verify OTP and change password for logged-in user
+router.post('/profile/password-otp/verify-and-change', authenticateToken, async (req, res) => {
+  const userId = req.user.id;
+  const { otp_code, new_password } = req.body;
+  const ip = req.ip || '127.0.0.1';
+
+  if (!otp_code || !new_password) {
+    return res.status(400).json({ error: 'OTP code and new password are required.' });
+  }
+
+  if (new_password.length < 8) {
+    return res.status(400).json({ error: 'New password must be at least 8 characters.' });
+  }
+
+  const passwordRegex = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[!@#$%^&*])/;
+  if (!passwordRegex.test(new_password)) {
+    return res.status(400).json({
+      error: 'Password must contain at least one uppercase letter, one lowercase letter, one number, and one special character (e.g. SBTWallet@2026).'
+    });
+  }
+
+  try {
+    const verification = profilePasswordOTPs.get(userId);
+    if (!verification || verification.otp !== otp_code || Date.now() > verification.expiresAt) {
+      return res.status(400).json({ error: 'Invalid or expired OTP code.' });
+    }
+
+    const historyRes = await db.query('SELECT password_hash FROM password_history WHERE user_id = $1 ORDER BY created_at DESC LIMIT 5', [userId]);
+    for (let row of historyRes.rows) {
+      const isReused = await bcrypt.compare(new_password, row.password_hash);
+      if (isReused) {
+        return res.status(400).json({ error: 'You cannot reuse any of your last 5 passwords.' });
+      }
+    }
+
+    const newHash = await bcrypt.hash(new_password, 10);
+    await db.query(
+      `UPDATE users 
+       SET password_hash = $1, 
+           temporary_password = NULL, 
+           temporary_password_created_at = NULL, 
+           must_change_password = FALSE 
+       WHERE id = $2`,
+      [newHash, userId]
+    );
+
+    await db.query('INSERT INTO password_history (user_id, password_hash) VALUES ($1, $2)', [userId, newHash]);
+    await logAudit(userId, req.user.role, 'PASSWORD_CHANGE_SETTINGS', ip, 'User updated account password via OTP settings page.');
+
+    // Clear verification session
+    profilePasswordOTPs.delete(userId);
+
+    res.json({ message: 'Password updated successfully.' });
+  } catch (err) {
+    console.error('Verify and change password settings error:', err);
+    res.status(500).json({ error: 'Server error.' });
+  }
+});
+
+// 14. Debug route to get profile password OTP
+router.get('/debug/profile-password-otp/:user_id', async (req, res) => {
+  const { user_id } = req.params;
+  try {
+    const userRes = await db.query('SELECT id FROM users WHERE user_id = $1', [user_id]);
+    if (userRes.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found.' });
+    }
+    const internalId = userRes.rows[0].id;
+    const data = profilePasswordOTPs.get(internalId);
+    if (!data) {
+      return res.status(404).json({ error: 'No OTP generated for this user profile.' });
+    }
+    res.json(data);
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
   }
