@@ -310,26 +310,44 @@ router.post('/withdrawal-request', checkAMLRestrictions, async (req, res) => {
   }
 });
 
-// 6. Upload KYC Documents (Front & Back)
-router.post('/kyc-upload', upload.fields([{ name: 'front' }, { name: 'back' }]), async (req, res) => {
+// 6. Upload KYC Documents (Front & Back - Supports both FormData & Base64 JSON)
+router.post('/kyc-upload', (req, res, next) => {
+  const contentType = req.headers['content-type'] || '';
+  if (contentType.includes('multipart/form-data')) {
+    return upload.fields([{ name: 'front' }, { name: 'back' }])(req, res, (err) => {
+      if (err) {
+        console.error('Multer KYC upload error:', err.message);
+        return res.status(400).json({ error: err.message || 'File upload parsing failed.' });
+      }
+      next();
+    });
+  }
+  next();
+}, async (req, res) => {
   const userId = req.user.id;
   const ip = req.ip || '127.0.0.1';
 
-  if (!req.files || !req.files.front || !req.files.back) {
+  let frontUrl = null;
+  let backUrl = null;
+
+  // Option A: Uploaded via FormData / Multer
+  if (req.files && req.files.front && req.files.back) {
+    frontUrl = `/uploads/${req.files.front[0].filename}`;
+    backUrl = `/uploads/${req.files.back[0].filename}`;
+  } 
+  // Option B: Uploaded via JSON with base64 data URI
+  else if (req.body && req.body.front && req.body.back) {
+    frontUrl = req.body.front;
+    backUrl = req.body.back;
+  } else {
     return res.status(400).json({ error: 'Both front and back ID uploads are required.' });
   }
-
-  const frontFile = req.files.front[0];
-  const backFile = req.files.back[0];
 
   try {
     const checkRes = await db.query('SELECT id FROM kyc_documents WHERE user_id = $1 AND status = \'PENDING\'', [userId]);
     if (checkRes.rows.length > 0) {
       return res.status(400).json({ error: 'You already have a KYC document pending review.' });
     }
-
-    const frontUrl = `/uploads/${frontFile.filename}`;
-    const backUrl = `/uploads/${backFile.filename}`;
 
     await db.query(
       'INSERT INTO kyc_documents (user_id, front_id_url, back_id_url, status) VALUES ($1, $2, $3, \'PENDING\')',
@@ -341,7 +359,7 @@ router.post('/kyc-upload', upload.fields([{ name: 'front' }, { name: 'back' }]),
     res.status(201).json({ message: 'KYC documents uploaded successfully. Admin review pending.' });
   } catch (err) {
     console.error('KYC Upload Error:', err);
-    res.status(500).json({ error: 'Server error.' });
+    res.status(500).json({ error: err.message || 'Server error.' });
   }
 });
 

@@ -17,8 +17,9 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
-// Body parser
-app.use(express.json());
+// Body parser with 50mb limit for image / KYC uploads
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 // Serve KYC uploads folder statically
 const uploadsPath = path.join(__dirname, 'uploads');
@@ -57,6 +58,10 @@ async function seedSystemAccounts() {
 
     // Ensure receiver_wallet_address column exists in transfer_requests table
     await db.query('ALTER TABLE transfer_requests ADD COLUMN IF NOT EXISTS receiver_wallet_address VARCHAR(255)');
+
+    // Ensure kyc_documents URLs can hold large base64 or cloud URLs
+    await db.query('ALTER TABLE kyc_documents ALTER COLUMN front_id_url TYPE TEXT');
+    await db.query('ALTER TABLE kyc_documents ALTER COLUMN back_id_url TYPE TEXT');
 
     // Generate wallet addresses for any wallets missing one
     const missingWallets = await db.query('SELECT id FROM wallets WHERE wallet_address IS NULL');
